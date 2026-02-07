@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -48,6 +49,25 @@ def llm(*args, **kwargs):
     def decorator(func):
         return func
     return decorator
+
+
+@contextmanager
+def optional_workflow(enabled: bool, name: str):
+    """
+    Context manager that wraps LLMObs workflow only if enabled.
+
+    Args:
+        enabled: Whether LLMObs is enabled
+        name: Name of the workflow
+
+    Yields:
+        bool: True if inside LLMObs context, False otherwise
+    """
+    if enabled:
+        with LLMObs.workflow(name=name):
+            yield True  # Inside LLMObs context
+    else:
+        yield False  # No-op context
 
 
 # Pydantic models for structured output
@@ -97,7 +117,6 @@ def initialize_llmobs():
     global LLMOBS_ENABLED
     
     dd_api_key = os.environ.get('DD_API_KEY')
-    print("Info: DD_API_KEY ***" + dd_api_key[0:5])
     
     if not dd_api_key:
         print("Info: DD_API_KEY not found - LLMObs disabled", file=sys.stderr)
@@ -256,11 +275,11 @@ def analyze_pdf_with_gemini(
             "GEMINI_API_KEY not found in environment variables.\n"
             "Please set it in .env file or export it in your shell."
         )
-    
-    # Use LLMObs workflow context manager if enabled
-    if LLMOBS_ENABLED:
-        with LLMObs.workflow(name="analyze_pdf_with_gemini"):
-            # Annotate workflow with input metadata
+
+    # Use optional workflow context manager
+    with optional_workflow(LLMOBS_ENABLED, "analyze_pdf_with_gemini") as in_llmobs:
+        # Annotate workflow with input metadata (only if LLMObs enabled)
+        if in_llmobs:
             try:
                 LLMObs.annotate(
                     input_data={
@@ -280,232 +299,31 @@ def analyze_pdf_with_gemini(
                 )
             except Exception as e:
                 print(f"Warning: Could not annotate workflow: {e}", file=sys.stderr)
-                # Continue without annotation
-            
-            # Validate PDF file
-            pdf_path_obj = Path(pdf_path)
-            if not pdf_path_obj.exists():
-                raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-            
-            print(f"Analyzing PDF: {pdf_path_obj.name}", file=sys.stderr)
-            if pages:
-                print(f"Pages: {pages}", file=sys.stderr)
-            print(f"Output format: {output_format}", file=sys.stderr)
-            print(f"Structured output: {use_structured_output}", file=sys.stderr)
-            print("", file=sys.stderr)
-            
-            # Initialize Gemini client
-            client = genai.Client(api_key=api_key)
-            
-            # Build prompt
-            prompt = build_prompt(instructions, output_format, pdf_path_obj.name)
-            
-            # Encode PDF
-            print("Encoding PDF...", file=sys.stderr)
-            pdf_base64 = encode_pdf_to_base64(pdf_path)
-            pdf_size_mb = len(pdf_base64) * 3 / 4 / 1024 / 1024  # Approximate original size
-            print(f"PDF size: ~{pdf_size_mb:.1f} MB", file=sys.stderr)
-            
-            # Prepare content for Gemini
-            parts = [
-                types.Part.from_text(text=prompt),
-                types.Part(
-                    inline_data=types.Blob(
-                        mime_type="application/pdf",
-                        data=pdf_base64
-                    )
-                )
-            ]
-            
-            contents = [
-                types.Content(
-                    role="user",
-                    parts=parts
-                )
-            ]
-            
-            # Configure generation with structured output
-            if use_structured_output and output_format == 'json':
-                generate_content_config = types.GenerateContentConfig(
-                    temperature=0.5,
-                    response_mime_type="application/json",
-                    response_schema=PoliticalPartyPolicies.model_json_schema(),
-                    thinking_config=types.ThinkingConfig(
-                        thinking_level="low",
-                    )
-                )
-            else:
-                generate_content_config = types.GenerateContentConfig(
-                    temperature=0.5,
-                    thinking_config=types.ThinkingConfig(
-                        thinking_level="low",
-                    )
-                )
-            
-            # Generate content with retry logic
-            result_text = ""
-            retry_count = 0
-            chunk_timeout = 180  # 3 minutes in seconds
-            
-            while retry_count <= max_retries:
-                if retry_count > 0:
-                    print(f"\n⚠ Retry attempt {retry_count}/{max_retries}...", file=sys.stderr)
-                
-                print(f"[{time.strftime('%H:%M:%S')}] Sending request to Gemini 3 Pro Preview...", file=sys.stderr)
-                print("This may take a moment for large PDFs...", file=sys.stderr)
-                print(f"Timeout detection: Will retry if no chunks for >{chunk_timeout}s", file=sys.stderr)
-                print("", file=sys.stderr)
-                
-                result_text = ""
-                last_chunk_time = time.time()
-                chunk_count = 0
-                
-                try:
-                    for chunk in client.models.generate_content_stream(
-                        model="gemini-3-pro-preview",
-                        contents=contents,
-                        config=generate_content_config,
-                    ):
-                        if chunk.text:
-                            current_time = time.time()
-                            elapsed = current_time - last_chunk_time
-                            
-                            # Check if stalled
-                            if elapsed > chunk_timeout and chunk_count > 0:
-                                print(f"\n⚠ Stream stalled for {elapsed:.0f}s (>{chunk_timeout}s)", file=sys.stderr)
-                                raise TimeoutError(f"Stream stalled for {elapsed:.0f} seconds")
-                            
-                            result_text += chunk.text
-                            chunk_count += 1
-                            last_chunk_time = current_time
-                            
-                            # Print progress with preview
-                            if chunk_count % 10 == 0:
-                                # Show preview every 10 chunks
-                                preview = chunk.text[:50].replace('\n', ' ')
-                                print(f"\n[Chunk {chunk_count}] {preview}...", end="", file=sys.stderr, flush=True)
-                            else:
-                                print(".", end="", file=sys.stderr, flush=True)
-                    
-                    # After all chunks received
-                    print("\n", file=sys.stderr)
-                    print(f"Extraction complete! ({chunk_count} chunks received)", file=sys.stderr)
-                    
-                    # Validate JSON if using structured output
-                    if use_structured_output and output_format == 'json':
-                        try:
-                            policies = PoliticalPartyPolicies.model_validate_json(result_text)
-                            print(f"✓ Validated: {len(policies.policies)} policies extracted", file=sys.stderr)
-                            # Re-serialize for consistent formatting
-                            result_text = policies.model_dump_json(indent=2)
-                        except Exception as e:
-                            print(f"⚠ Warning: JSON validation failed: {e}", file=sys.stderr)
-                            # If validation fails with only 1 chunk, treat as incomplete and retry
-                            if chunk_count == 1:
-                                print(f"⚠ Only 1 chunk received with invalid JSON - likely incomplete response", file=sys.stderr)
-                                raise ValueError("Incomplete JSON response - only 1 chunk received")
-                    
-                    # Success - break out of retry loop
-                    break
-                    
-                except TimeoutError as e:
-                    print(f"\n✗ Timeout: {e}", file=sys.stderr)
-                    retry_count += 1
-                    if retry_count > max_retries:
-                        print(f"\n✗ Failed after {max_retries} retries", file=sys.stderr)
-                        raise
-                    # Continue to next retry attempt
-                    
-                except ValueError as e:
-                    # Incomplete response
-                    print(f"\n✗ Incomplete response: {e}", file=sys.stderr)
-                    retry_count += 1
-                    if retry_count > max_retries:
-                        print(f"\n✗ Failed after {max_retries} retries", file=sys.stderr)
-                        raise
-                    # Continue to next retry attempt
-                    
-                except Exception as e:
-                    print(f"\nError during generation: {e}", file=sys.stderr)
-                    retry_count += 1
-                    if retry_count > max_retries:
-                        raise
-                    # Continue to next retry attempt
-            
-            # Export span context for evaluation tracking
-            span_context = None
-            if LLMOBS_ENABLED:
-                try:
-                    span_context = LLMObs.export_span()
-                except Exception as e:
-                    print(f"Warning: Could not export span context: {e}", file=sys.stderr)
-            
-            # Add span context to result if available
-            if span_context and use_structured_output and output_format == 'json':
-                try:
-                    result_dict = json.loads(result_text)
-                    result_dict['_llmobs_span_context'] = span_context
-                    result_text = json.dumps(result_dict, indent=2, ensure_ascii=False)
-                except:
-                    pass  # If can't add, continue without it
-            
-            # Save to file if specified
-            if output_file:
-                output_path = Path(output_file)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    f.write(result_text)
-                print(f"Output saved to: {output_file}", file=sys.stderr)
-            
-            # Final workflow annotation
-            if LLMOBS_ENABLED:
-                try:
-                    policies_count = 0
-                    if use_structured_output and output_format == 'json':
-                        result_dict = json.loads(result_text)
-                        policies_count = len(result_dict.get('policies', []))
-                    
-                    LLMObs.annotate(
-                        output_data={
-                            "policies_extracted": policies_count,
-                            "output_file": output_file,
-                            "span_context_exported": span_context is not None
-                        },
-                        metrics={
-                            "policies_count": policies_count,
-                            "total_retries": retry_count
-                        }
-                    )
-                except Exception as e:
-                    print(f"Warning: Could not annotate final output: {e}", file=sys.stderr)
-            
-            return result_text
-    else:
-        # LLMObs disabled - run without context manager
+
         # Validate PDF file
         pdf_path_obj = Path(pdf_path)
         if not pdf_path_obj.exists():
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-        
+
         print(f"Analyzing PDF: {pdf_path_obj.name}", file=sys.stderr)
         if pages:
             print(f"Pages: {pages}", file=sys.stderr)
         print(f"Output format: {output_format}", file=sys.stderr)
         print(f"Structured output: {use_structured_output}", file=sys.stderr)
         print("", file=sys.stderr)
-        
+
         # Initialize Gemini client
         client = genai.Client(api_key=api_key)
-        
+
         # Build prompt
         prompt = build_prompt(instructions, output_format, pdf_path_obj.name)
-        
+
         # Encode PDF
         print("Encoding PDF...", file=sys.stderr)
         pdf_base64 = encode_pdf_to_base64(pdf_path)
         pdf_size_mb = len(pdf_base64) * 3 / 4 / 1024 / 1024  # Approximate original size
         print(f"PDF size: ~{pdf_size_mb:.1f} MB", file=sys.stderr)
-        
+
         # Prepare content for Gemini
         parts = [
             types.Part.from_text(text=prompt),
@@ -516,14 +334,14 @@ def analyze_pdf_with_gemini(
                 )
             )
         ]
-        
+
         contents = [
             types.Content(
                 role="user",
                 parts=parts
             )
         ]
-        
+
         # Configure generation with structured output
         if use_structured_output and output_format == 'json':
             generate_content_config = types.GenerateContentConfig(
@@ -541,25 +359,25 @@ def analyze_pdf_with_gemini(
                     thinking_level="low",
                 )
             )
-        
+
         # Generate content with retry logic
         result_text = ""
         retry_count = 0
         chunk_timeout = 180  # 3 minutes in seconds
-        
+
         while retry_count <= max_retries:
             if retry_count > 0:
                 print(f"\n⚠ Retry attempt {retry_count}/{max_retries}...", file=sys.stderr)
-            
+
             print(f"[{time.strftime('%H:%M:%S')}] Sending request to Gemini 3 Pro Preview...", file=sys.stderr)
             print("This may take a moment for large PDFs...", file=sys.stderr)
             print(f"Timeout detection: Will retry if no chunks for >{chunk_timeout}s", file=sys.stderr)
             print("", file=sys.stderr)
-            
+
             result_text = ""
             last_chunk_time = time.time()
             chunk_count = 0
-            
+
             try:
                 for chunk in client.models.generate_content_stream(
                     model="gemini-3-pro-preview",
@@ -569,16 +387,16 @@ def analyze_pdf_with_gemini(
                     if chunk.text:
                         current_time = time.time()
                         elapsed = current_time - last_chunk_time
-                        
+
                         # Check if stalled
                         if elapsed > chunk_timeout and chunk_count > 0:
                             print(f"\n⚠ Stream stalled for {elapsed:.0f}s (>{chunk_timeout}s)", file=sys.stderr)
                             raise TimeoutError(f"Stream stalled for {elapsed:.0f} seconds")
-                        
+
                         result_text += chunk.text
                         chunk_count += 1
                         last_chunk_time = current_time
-                        
+
                         # Print progress with preview
                         if chunk_count % 10 == 0:
                             # Show preview every 10 chunks
@@ -586,11 +404,11 @@ def analyze_pdf_with_gemini(
                             print(f"\n[Chunk {chunk_count}] {preview}...", end="", file=sys.stderr, flush=True)
                         else:
                             print(".", end="", file=sys.stderr, flush=True)
-                
+
                 # After all chunks received
                 print("\n", file=sys.stderr)
                 print(f"Extraction complete! ({chunk_count} chunks received)", file=sys.stderr)
-                
+
                 # Validate JSON if using structured output
                 if use_structured_output and output_format == 'json':
                     try:
@@ -604,10 +422,10 @@ def analyze_pdf_with_gemini(
                         if chunk_count == 1:
                             print(f"⚠ Only 1 chunk received with invalid JSON - likely incomplete response", file=sys.stderr)
                             raise ValueError("Incomplete JSON response - only 1 chunk received")
-                
+
                 # Success - break out of retry loop
                 break
-                
+
             except TimeoutError as e:
                 print(f"\n✗ Timeout: {e}", file=sys.stderr)
                 retry_count += 1
@@ -615,7 +433,7 @@ def analyze_pdf_with_gemini(
                     print(f"\n✗ Failed after {max_retries} retries", file=sys.stderr)
                     raise
                 # Continue to next retry attempt
-                
+
             except ValueError as e:
                 # Incomplete response
                 print(f"\n✗ Incomplete response: {e}", file=sys.stderr)
@@ -624,14 +442,31 @@ def analyze_pdf_with_gemini(
                     print(f"\n✗ Failed after {max_retries} retries", file=sys.stderr)
                     raise
                 # Continue to next retry attempt
-                
+
             except Exception as e:
                 print(f"\nError during generation: {e}", file=sys.stderr)
                 retry_count += 1
                 if retry_count > max_retries:
                     raise
                 # Continue to next retry attempt
-        
+
+        # Export span context for evaluation tracking (only if LLMObs enabled)
+        span_context = None
+        if in_llmobs:
+            try:
+                span_context = LLMObs.export_span()
+            except Exception as e:
+                print(f"Warning: Could not export span context: {e}", file=sys.stderr)
+
+        # Add span context to result if available
+        if span_context and use_structured_output and output_format == 'json':
+            try:
+                result_dict = json.loads(result_text)
+                result_dict['_llmobs_span_context'] = span_context
+                result_text = json.dumps(result_dict, indent=2, ensure_ascii=False)
+            except:
+                pass  # If can't add, continue without it
+
         # Save to file if specified
         if output_file:
             output_path = Path(output_file)
@@ -639,7 +474,29 @@ def analyze_pdf_with_gemini(
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(result_text)
             print(f"Output saved to: {output_file}", file=sys.stderr)
-        
+
+        # Final workflow annotation (only if LLMObs enabled)
+        if in_llmobs:
+            try:
+                policies_count = 0
+                if use_structured_output and output_format == 'json':
+                    result_dict = json.loads(result_text)
+                    policies_count = len(result_dict.get('policies', []))
+
+                LLMObs.annotate(
+                    output_data={
+                        "policies_extracted": policies_count,
+                        "output_file": output_file,
+                        "span_context_exported": span_context is not None
+                    },
+                    metrics={
+                        "policies_count": policies_count,
+                        "total_retries": retry_count
+                    }
+                )
+            except Exception as e:
+                print(f"Warning: Could not annotate final output: {e}", file=sys.stderr)
+
         return result_text
 
 
