@@ -1,0 +1,12 @@
+# Required packages for Thailand Election Policy Extraction
+
+# Core packages (required)
+google-genai>=1.60.0
+pydantic>=2.0.0
+requests>=2.31.0
+
+# Optional packages
+ddtrace>=4.0.0  # For Datadog LLMObs tracing (optional but recommended)
+
+# Additional utilities
+python-dotenv>=1.0.0  # For .env file loading (optional)
